@@ -1,5 +1,5 @@
 python-telegram-bot==22.1
 uvicorn==0.34.2
 starlette==0.46.2
-requests
+cloudscraper
 beautifulsoup4

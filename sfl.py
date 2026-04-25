@@ -8,7 +8,7 @@ from starlette.responses import PlainTextResponse, Response
 from starlette.routing import Route
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
-import requests
+import cloudscraper
 from bs4 import BeautifulSoup
 
 # --- Cấu hình logging ---
@@ -29,76 +29,75 @@ if not TOKEN:
 USE_WEBHOOK = URL is not None
 logger.info("Bot đang chạy ở chế độ: %s", "webhook" if USE_WEBHOOK else "polling")
 
-# --- Hàm lấy giá từ web (cải tiến, linh hoạt) ---
+# --- Hàm lấy giá từ web (dùng cloudscraper để vượt Cloudflare) ---
 def fetch_prices():
     url = "https://sfl.world/util/prices"
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-    }
     try:
-        response = requests.get(url, timeout=15, headers=headers)
+        # Tạo scraper với cấu hình giống trình duyệt
+        scraper = cloudscraper.create_scraper(
+            browser={
+                'browser': 'chrome',
+                'platform': 'windows',
+                'mobile': False
+            }
+        )
+        response = scraper.get(url, timeout=30)
         response.raise_for_status()
-        soup = BeautifulSoup(response.text, 'html.parser')
         
-        # Cách 1: Tìm bảng bằng thẻ <table>
+        soup = BeautifulSoup(response.text, 'html.parser')
         table = soup.find('table')
         if not table:
-            # Cách 2: Tìm bảng trong div phổ biến
-            table = soup.find('div', class_='prices-table') or soup.find('div', class_='table-responsive')
-            if table:
-                table = table.find('table')
-        
+            # Thử tìm trong div table-responsive
+            table_div = soup.find('div', class_='table-responsive')
+            if table_div:
+                table = table_div.find('table')
         if not table:
-            logger.warning("Không tìm thấy bảng giá")
             return "⚠️ Không tìm thấy bảng giá. Trang có thể đã đổi cấu trúc."
-
+        
         rows = table.find_all('tr')
         if len(rows) < 2:
             return "⚠️ Bảng giá không có dữ liệu."
-
-        # Phân tích header để xác định thứ tự cột
-        header_row = rows[0]
-        headers_cols = [th.get_text(strip=True).lower() for th in header_row.find_all(['th', 'td'])]
         
-        col_map = {}
-        for idx, name in enumerate(headers_cols):
-            if 'item' in name or 'tên' in name or 'product' in name:
-                col_map['item'] = idx
-            elif 'p2p' in name:
-                col_map['p2p'] = idx
-            elif 'seq' in name:
-                col_map['seq'] = idx
-            elif 'betty' in name or 'cửa hàng' in name:
-                col_map['betty'] = idx
-        
-        # Mặc định nếu không tìm thấy (cột 0: item, 1: p2p, 2: seq, 3: betty)
-        if not col_map:
-            col_map = {'item': 0, 'p2p': 1, 'seq': 2, 'betty': 3}
+        # Dựa trên kết quả test, hàng 0 là header, các hàng tiếp theo là dữ liệu
+        # Trong test, dòng 1 là ["Greenhouse"] (tên nhóm), dòng 2 là ["Grape", ...]
+        # Cần xử lý các dòng không có đủ cột
         
         lines = ["📊 *Giá Sunflower Land hôm nay* 📊\n"]
-        for row in rows[1:]:
+        i = 1
+        while i < len(rows):
+            row = rows[i]
             cells = row.find_all(['td', 'th'])
-            if len(cells) < 4:
-                continue
-            item = cells[col_map['item']].get_text(strip=True) if col_map['item'] < len(cells) else "?"
-            p2p = cells[col_map['p2p']].get_text(strip=True) if col_map['p2p'] < len(cells) else "?"
-            seq = cells[col_map['seq']].get_text(strip=True) if col_map['seq'] < len(cells) else "?"
-            betty = cells[col_map['betty']].get_text(strip=True) if col_map['betty'] < len(cells) else "?"
+            cell_texts = [c.get_text(strip=True) for c in cells]
             
-            lines.append(f"🔹 *{item}*")
-            lines.append(f"   P2P: `{p2p}` | Seq: `{seq}` | Betty: `{betty}`")
-            lines.append("")
+            # Nếu chỉ có 1 cột, đó có thể là tên nhóm (ví dụ "Greenhouse")
+            if len(cell_texts) == 1 and cell_texts[0]:
+                lines.append(f"🏷️ *{cell_texts[0]}*")
+                i += 1
+                continue
+            
+            # Dòng dữ liệu bình thường có ít nhất 4 cột (item, p2p, seq, betty)
+            if len(cell_texts) >= 4:
+                item = cell_texts[0]
+                p2p = cell_texts[1] if len(cell_texts) > 1 else "?"
+                # Cột thứ 2 có thể là seq (trong test, cột 2 là rỗng, cột 3 là seq? Hãy xem lại)
+                # Trong test: Dòng 2: ['Grape', '0.26086', '', '0.75000', ...]
+                # Vậy cells[1] là P2P, cells[2] là rỗng (không dùng), cells[3] là Seq? Không, Betty ở cells[3]?
+                # Thực tế, dựa vào header: ['Item', 'P2P-10%', 'Seq-30%', 'Betty1:320', ...]
+                # Nên cells[1] = P2P, cells[2] = Seq, cells[3] = Betty
+                seq = cell_texts[2] if len(cell_texts) > 2 else "?"
+                betty = cell_texts[3] if len(cell_texts) > 3 else "?"
+                lines.append(f"🔹 *{item}*")
+                lines.append(f"   P2P: `{p2p}` | Seq: `{seq}` | Betty: `{betty}`")
+                lines.append("")
+            i += 1
         
         if len(lines) == 1:
             return "⚠️ Không đọc được dữ liệu từ bảng."
         return "\n".join(lines)
         
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Lỗi kết nối: {e}")
-        return f"⚠️ Lỗi kết nối đến trang web: {str(e)}"
     except Exception as e:
-        logger.error(f"Lỗi parse: {e}")
-        return f"⚠️ Lỗi xử lý dữ liệu: {str(e)}"
+        logger.error(f"Lỗi fetch: {e}")
+        return f"⚠️ Lỗi khi lấy giá: {str(e)}"
 
 # --- Các lệnh bot ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
